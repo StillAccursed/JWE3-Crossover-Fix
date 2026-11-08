@@ -1,0 +1,10 @@
+LIBRARY d3d12.dll
+EXPORTS
+D3D12CreateDevice=ProxyCreateDevice @101
+D3D12GetDebugInterface=ProxyDebug @102
+D3D12CreateRootSignatureDeserializer=ProxyDeserialize @106
+D3D12CreateVersionedRootSignatureDeserializer=ProxyDeserializeVersioned @107
+D3D12EnableExperimentalFeatures=ProxyExperimental @108
+D3D12GetInterface=ProxyGetInterface @109
+D3D12SerializeRootSignature=ProxySerialize @110
+D3D12SerializeVersionedRootSignature=ProxySerializeVersioned @111

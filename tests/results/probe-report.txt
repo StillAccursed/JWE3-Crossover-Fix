@@ -1,0 +1,3 @@
+CPU -> GPU -> readback: 5a5a1234, expected 5a5a1234
+GPU -> CPU at public fence: 1234abcd, expected 1234abcd
+PASS
