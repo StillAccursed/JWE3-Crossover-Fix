@@ -6,6 +6,7 @@
 #include <d3d12.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <new>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -361,25 +363,373 @@ HRESULT STDMETHODCALLTYPE CreatePlaced(ID3D12Device* device, ID3D12Heap* heap, U
     return S_OK;
 }
 
+enum class FenceStage {
+    Idle,
+    GetDevice,
+    CreateGpuFence,
+    CreateCpuFence,
+    SubmitCallback,
+    QueueGpuSignal,
+    QueueCpuWait,
+    QueueGameSignal,
+    QueueDone,
+    WaitForGpu,
+    ReadGpuFence,
+    AcquireCopyLock,
+    CopyToGame,
+    SignalCpuFence,
+    CopyDone
+};
+
+#ifdef JWE3_FENCE_TRACE
+class FenceTrace {
+    static constexpr size_t SLOT_COUNT = 128;
+    static constexpr size_t REPORT_COUNT = 3;
+    static constexpr size_t REPORT_LIMIT = 64 * 1024;
+    static constexpr DWORD POLL_MS = 1000;
+    static constexpr ULONGLONG STALL_MS = 2000;
+
+    struct Slot {
+        std::atomic<unsigned> _owners{0};
+        std::atomic<uint64_t> _queueStage{0};
+        std::atomic<uint64_t> _copyStage{0};
+        uint64_t _id = 0;
+        uintptr_t _queue = 0;
+        uintptr_t _fence = 0;
+        uint64_t _fenceValue = 0;
+        uint64_t _observedQueue = 0;
+        uint64_t _observedCopy = 0;
+        ULONGLONG _lastProgress = 0;
+        bool _reportedError = false;
+    };
+
+    struct Entry {
+        uint64_t _id;
+        uintptr_t _queue;
+        uintptr_t _fence;
+        uint64_t _fenceValue;
+        uint64_t _queueStage;
+        uint64_t _copyStage;
+        ULONGLONG _idleMs;
+        unsigned _owners;
+    };
+
+    struct Report {
+        std::array<Entry, SLOT_COUNT> _entries{};
+        size_t _count = 0;
+        uint64_t _dropped = 0;
+        bool _stall = false;
+        bool _error = false;
+    };
+
+    SRWLOCK _registryLock = SRWLOCK_INIT;
+    std::array<Slot, SLOT_COUNT> _slots{};
+    size_t _nextSlot = 0;
+    uint64_t _nextId = 0;
+    std::atomic<uint64_t> _dropped{0};
+    bool _reportedStall = false;
+
+public:
+    class Ticket {
+        friend class FenceTrace;
+        Slot* _slot = nullptr;
+        bool _copy = false;
+
+        Ticket(Slot* slot, bool copy) : _slot(slot), _copy(copy) {}
+
+    public:
+        Ticket() = default;
+        Ticket(const Ticket&) = delete;
+        Ticket& operator=(const Ticket&) = delete;
+        Ticket(Ticket&& other) noexcept : _slot(std::exchange(other._slot, nullptr)),
+                                          _copy(other._copy) {}
+
+        ~Ticket() {
+            if (_slot) {
+                _slot->_owners.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+
+        // The queue and callback update separate lanes even if their calls overlap.
+        void Record(FenceStage stage, HRESULT result = S_OK) const {
+            if (_slot) {
+                auto& lane = _copy ? _slot->_copyStage : _slot->_queueStage;
+                const auto packed = (static_cast<uint64_t>(stage) << 32) |
+                                    static_cast<uint32_t>(result);
+                lane.store(packed, std::memory_order_relaxed);
+            }
+        }
+
+        Ticket Fork() const {
+            if (_slot) {
+                _slot->_owners.fetch_add(1, std::memory_order_relaxed);
+            }
+            return Ticket(_slot, true);
+        }
+    };
+
+    static Ticket Begin(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) {
+        static FenceTrace trace;
+        static const bool started = trace.Start();
+        return started ? trace.Register(queue, fence, value) : Ticket{};
+    }
+
+private:
+    static bool IsError(uint64_t packed) {
+        return (packed & 0x80000000u) != 0;
+    }
+
+    bool Start() {
+        // Keep the module loaded while its process-lifetime monitor is running.
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                reinterpret_cast<LPCWSTR>(&Monitor), &module)) {
+            return false;
+        }
+        const auto thread = CreateThread(nullptr, 0, Monitor, this, 0, nullptr);
+        if (!thread) {
+            return false;
+        }
+        SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+        CloseHandle(thread);
+        return true;
+    }
+
+    Ticket Register(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) {
+        if (!TryAcquireSRWLockExclusive(&_registryLock)) {
+            _dropped.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+        for (size_t i = 0; i < SLOT_COUNT; ++i) {
+            const auto index = (_nextSlot + i) % SLOT_COUNT;
+            auto& slot = _slots[index];
+            if (slot._owners.load(std::memory_order_acquire) ||
+                (!slot._reportedError && (IsError(slot._queueStage.load(std::memory_order_relaxed)) ||
+                                          IsError(slot._copyStage.load(std::memory_order_relaxed))))) {
+                continue;
+            }
+            slot._id = ++_nextId;
+            slot._queue = reinterpret_cast<uintptr_t>(queue);
+            slot._fence = reinterpret_cast<uintptr_t>(fence);
+            slot._fenceValue = value;
+            slot._observedQueue = 0;
+            slot._observedCopy = 0;
+            slot._lastProgress = 0;
+            slot._reportedError = false;
+            slot._queueStage.store(0, std::memory_order_relaxed);
+            slot._copyStage.store(0, std::memory_order_relaxed);
+            slot._owners.store(1, std::memory_order_relaxed);
+            _nextSlot = (index + 1) % SLOT_COUNT;
+            ReleaseSRWLockExclusive(&_registryLock);
+            return Ticket(&slot, false);
+        }
+        _dropped.fetch_add(1, std::memory_order_relaxed);
+        ReleaseSRWLockExclusive(&_registryLock);
+        return {};
+    }
+
+    // Only the monitor inspects progress. The lock protects slot reuse during a scan.
+    bool Scan(ULONGLONG now, Report& report) {
+        if (!TryAcquireSRWLockExclusive(&_registryLock)) {
+            return false;
+        }
+        bool stalled = false;
+        bool failed = false;
+        report._dropped = _dropped.load(std::memory_order_relaxed);
+        for (auto& slot : _slots) {
+            const auto owners = slot._owners.load(std::memory_order_acquire);
+            const auto queue = slot._queueStage.load(std::memory_order_relaxed);
+            const auto copy = slot._copyStage.load(std::memory_order_relaxed);
+            const bool newError = !slot._reportedError && (IsError(queue) || IsError(copy));
+            if (!owners && !newError) {
+                continue;
+            }
+            if (!slot._lastProgress || queue != slot._observedQueue || copy != slot._observedCopy) {
+                slot._lastProgress = now;
+                slot._observedQueue = queue;
+                slot._observedCopy = copy;
+            }
+            const auto idle = now - slot._lastProgress;
+            stalled |= owners && idle >= STALL_MS;
+            failed |= newError;
+            slot._reportedError |= newError;
+            report._entries[report._count++] = {
+                slot._id, slot._queue, slot._fence, slot._fenceValue, queue, copy, idle, owners
+            };
+        }
+        ReleaseSRWLockExclusive(&_registryLock);
+        report._stall = stalled && !_reportedStall;
+        report._error = failed;
+        _reportedStall = stalled;
+        return report._stall || report._error;
+    }
+
+    static const char* StageName(uint64_t packed) {
+        static constexpr const char* names[] = {
+            "idle", "get-device", "create-gpu-fence", "create-cpu-fence", "submit-callback",
+            "queue-gpu-signal", "queue-cpu-wait", "queue-game-signal", "queue-done",
+            "wait-for-gpu", "read-gpu-fence", "acquire-copy-lock", "copy-to-game",
+            "signal-cpu-fence", "copy-done"
+        };
+        return names[packed >> 32];
+    }
+
+    static bool WriteReport(const Report& report) {
+        wchar_t folder[MAX_PATH]{};
+        const auto length = GetTempPathW(MAX_PATH, folder);
+        constexpr wchar_t folderName[] = L"JWE3-FenceTrace";
+        if (!length || length >= MAX_PATH - std::size(folderName) - 20) {
+            return false;
+        }
+        wcscpy(folder + length, folderName);
+        if (!CreateDirectoryW(folder, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            return false;
+        }
+
+        // Serialize rotation across processes in the same bottle.
+        const auto mutex = CreateMutexW(nullptr, FALSE, L"Local\\JWE3-FenceTrace-Report");
+        if (!mutex) {
+            return false;
+        }
+        const auto wait = WaitForSingleObject(mutex, 1000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+            CloseHandle(mutex);
+            return false;
+        }
+        const bool written = WriteRotatingReport(report, folder);
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return written;
+    }
+
+    static bool WriteRotatingReport(const Report& report, const wchar_t* folder) {
+        std::array<char, REPORT_LIMIT> buffer{};
+        SYSTEMTIME utc{};
+        GetSystemTime(&utc);
+        const auto header = snprintf(buffer.data(), buffer.size(),
+            "JWE3 fence trace v1 UTC=%04u-%02u-%02uT%02u:%02u:%02u.%03uZ pid=%lu "
+            "stall=%u error=%u dropped_jobs=%llu\r\n",
+            utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond, utc.wMilliseconds,
+            GetCurrentProcessId(), static_cast<unsigned>(report._stall),
+            static_cast<unsigned>(report._error), static_cast<unsigned long long>(report._dropped));
+        if (header <= 0 || static_cast<size_t>(header) >= buffer.size()) {
+            return false;
+        }
+        size_t size = static_cast<size_t>(header);
+        for (size_t i = 0; i < report._count; ++i) {
+            const auto& entry = report._entries[i];
+            const auto remaining = buffer.size() - size;
+            const auto count = snprintf(buffer.data() + size, remaining,
+                "job=%llu queue=%#llx game_fence=%#llx game_fence_value=%llu owners=%u idle_ms=%llu "
+                "queue_stage=%s queue_hr=0x%08x copy_stage=%s copy_hr=0x%08x\r\n",
+                static_cast<unsigned long long>(entry._id),
+                static_cast<unsigned long long>(entry._queue),
+                static_cast<unsigned long long>(entry._fence),
+                static_cast<unsigned long long>(entry._fenceValue), entry._owners,
+                static_cast<unsigned long long>(entry._idleMs),
+                StageName(entry._queueStage), static_cast<unsigned>(entry._queueStage),
+                StageName(entry._copyStage), static_cast<unsigned>(entry._copyStage));
+            if (count <= 0 || static_cast<size_t>(count) >= remaining) {
+                break;
+            }
+            size += static_cast<size_t>(count);
+        }
+
+        wchar_t target[MAX_PATH]{};
+        FILETIME oldest{};
+        for (size_t i = 0; i < REPORT_COUNT; ++i) {
+            wchar_t candidate[MAX_PATH]{};
+            swprintf(candidate, MAX_PATH, L"%ls\\fences-%u.log", folder,
+                     static_cast<unsigned>(i + 1));
+            WIN32_FILE_ATTRIBUTE_DATA attributes{};
+            if (!GetFileAttributesExW(candidate, GetFileExInfoStandard, &attributes)) {
+                if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+                    wcscpy(target, candidate);
+                    break;
+                }
+                continue;
+            }
+            if (!*target || CompareFileTime(&attributes.ftLastWriteTime, &oldest) < 0) {
+                oldest = attributes.ftLastWriteTime;
+                wcscpy(target, candidate);
+            }
+        }
+        if (!*target) {
+            return false;
+        }
+        const auto file = CreateFileW(target, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        DWORD written = 0;
+        const auto bytes = static_cast<DWORD>(size);
+        const bool success = WriteFile(file, buffer.data(), bytes, &written, nullptr) &&
+                             written == bytes && FlushFileBuffers(file);
+        CloseHandle(file);
+        return success;
+    }
+
+    static DWORD WINAPI Monitor(void* context) {
+        auto& trace = *static_cast<FenceTrace*>(context);
+        while (true) {
+            Sleep(POLL_MS);
+            Report report;
+            if (trace.Scan(GetTickCount64(), report)) {
+                WriteReport(report);
+            }
+        }
+    }
+};
+#else
+class FenceTrace {
+public:
+    struct Ticket {
+        void Record(FenceStage, HRESULT = S_OK) const {}
+        Ticket Fork() const { return {}; }
+    };
+
+    static Ticket Begin(ID3D12CommandQueue*, ID3D12Fence*, uint64_t) { return {}; }
+};
+#endif
+
 struct SyncJob {
     ComPtr<ID3D12Fence> _gpuDone;
     ComPtr<ID3D12Fence> _cpuDone;
+    FenceTrace::Ticket _trace;
+
+    explicit SyncJob(FenceTrace::Ticket trace) : _trace(std::move(trace)) {}
 };
 
 void CALLBACK CopyBack(PTP_CALLBACK_INSTANCE, void* data) {
     std::unique_ptr<SyncJob> job(static_cast<SyncJob*>(data));
-    auto hr = ID3D12Fence_SetEventOnCompletion(job->_gpuDone.get(), 1, nullptr);
-    if (SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(job->_gpuDone.get()) != UINT64_MAX) {
-        auto& state = GetState();
-        {
-            std::lock_guard lock(state._lock);
-            if (!Sync(state, false)) {
-                Log("GPU to CPU synchronization failed\r\n");
-                return;
-            }
-        }
-        ID3D12Fence_Signal(job->_cpuDone.get(), 1);
+    job->_trace.Record(FenceStage::WaitForGpu);
+    const auto hr = ID3D12Fence_SetEventOnCompletion(job->_gpuDone.get(), 1, nullptr);
+    if (FAILED(hr)) {
+        job->_trace.Record(FenceStage::WaitForGpu, hr);
+        return;
     }
+    job->_trace.Record(FenceStage::ReadGpuFence);
+    if (ID3D12Fence_GetCompletedValue(job->_gpuDone.get()) == UINT64_MAX) {
+        job->_trace.Record(FenceStage::ReadGpuFence, DXGI_ERROR_DEVICE_REMOVED);
+        return;
+    }
+    auto& state = GetState();
+    job->_trace.Record(FenceStage::AcquireCopyLock);
+    {
+        std::lock_guard lock(state._lock);
+        job->_trace.Record(FenceStage::CopyToGame);
+        if (!Sync(state, false)) {
+            job->_trace.Record(FenceStage::CopyToGame, E_FAIL);
+            Log("GPU to CPU synchronization failed\r\n");
+            return;
+        }
+    }
+    job->_trace.Record(FenceStage::SignalCpuFence);
+    const auto signaled = ID3D12Fence_Signal(job->_cpuDone.get(), 1);
+    job->_trace.Record(FAILED(signaled) ? FenceStage::SignalCpuFence : FenceStage::CopyDone,
+                       signaled);
 }
 
 void STDMETHODCALLTYPE Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
@@ -402,18 +752,25 @@ HRESULT STDMETHODCALLTYPE Signal(ID3D12CommandQueue* queue, ID3D12Fence* fence, 
         return signal(queue, fence, value);
     }
 
+    const auto trace = FenceTrace::Begin(queue, fence, value);
+    trace.Record(FenceStage::GetDevice);
     ID3D12Device* raw = nullptr;
     auto hr = ID3D12CommandQueue_GetDevice(queue, IID_ID3D12Device, reinterpret_cast<void**>(&raw));
     if (FAILED(hr)) {
+        trace.Record(FenceStage::GetDevice, hr);
         return hr;
     }
     ComPtr<ID3D12Device> device(raw);
-    auto job = std::make_unique<SyncJob>();
+    auto job = std::make_unique<SyncJob>(trace.Fork());
     for (auto* destination : {&job->_gpuDone, &job->_cpuDone}) {
+        const auto stage = destination == &job->_gpuDone ? FenceStage::CreateGpuFence :
+                                                          FenceStage::CreateCpuFence;
+        trace.Record(stage);
         ID3D12Fence* created = nullptr;
         hr = ID3D12Device_CreateFence(device.get(), 0, D3D12_FENCE_FLAG_NONE, IID_ID3D12Fence,
                                     reinterpret_cast<void**>(&created));
         if (FAILED(hr)) {
+            trace.Record(stage, hr);
             return hr;
         }
         destination->reset(created);
@@ -424,21 +781,31 @@ HRESULT STDMETHODCALLTYPE Signal(ID3D12CommandQueue* queue, ID3D12Fence* fence, 
     ID3D12Fence_AddRef(cpuDone);
     ComPtr<ID3D12Fence> keepGpuDone(gpuDone), keepCpuDone(cpuDone);
     auto* pending = job.release();
+    trace.Record(FenceStage::SubmitCallback);
     if (!TrySubmitThreadpoolCallback(CopyBack, pending, nullptr)) {
         const auto error = GetLastError();
         delete pending;
-        return HRESULT_FROM_WIN32(error);
+        hr = HRESULT_FROM_WIN32(error);
+        trace.Record(FenceStage::SubmitCallback, hr);
+        return hr;
     }
+    trace.Record(FenceStage::QueueGpuSignal);
     hr = signal(queue, gpuDone, 1);
     if (FAILED(hr)) {
+        trace.Record(FenceStage::QueueGpuSignal, hr);
         ID3D12Fence_Signal(gpuDone, 1);
         return hr;
     }
+    trace.Record(FenceStage::QueueCpuWait);
     hr = ID3D12CommandQueue_Wait(queue, cpuDone, 1);
     if (FAILED(hr)) {
+        trace.Record(FenceStage::QueueCpuWait, hr);
         return hr;
     }
-    return signal(queue, fence, value);
+    trace.Record(FenceStage::QueueGameSignal);
+    hr = signal(queue, fence, value);
+    trace.Record(FAILED(hr) ? FenceStage::QueueGameSignal : FenceStage::QueueDone, hr);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CreateQueue(ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC* desc,

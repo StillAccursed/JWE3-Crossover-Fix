@@ -21,6 +21,14 @@
 
 For diagnostics, launch through CrossOver with `WINEDLLOVERRIDES=d3d12=n,b` if necessary. Set `JWE3_D3D12_LOG` to a writable Windows file path for shim logs or `JWE3_PROBE_REPORT` for probe output. Set `JWE3_D3D12_PASSTHROUGH=1` to disable the device hooks for a baseline run.
 
+## Fence stall reports
+
+Build the shim with `-DJWE3_FENCE_TRACE` added to the README's compiler command. The diagnostic DLL activates automatically when Steam Play launches the game and the shim handles a queue signal for a mirrored heap.
+
+The recorder tracks up to 128 outstanding jobs in memory. The queue and copyback worker each record their current stage and any failed result. The monitor samples once a second. It writes a report when it observes two seconds without progress or sees a failed operation. Healthy play produces no fence report and the render path performs no report I/O. If tracking slots are busy or full, the report gives the count of jobs skipped. The shim does not query the GPU from the monitor or alter fence ordering.
+
+Reports are in `%TEMP%\JWE3-FenceTrace` inside the bottle. In CrossOver, open the bottle's C: drive and navigate to `users/crossover/AppData/Local/Temp/JWE3-FenceTrace`. The recorder retains three files of up to 64 KiB each and reuses the oldest. Compare the UTC timestamp with the Frontier minidump and the Mac's power log. A job in `queue-done` and `wait-for-gpu` reached the game's queue signal while the copyback worker was still waiting for the internal GPU fence. An abrupt exit before the monitor samples can leave no report.
+
 ## Credits
 
 fladnaG86’s FH2-Port-AppleSilicon demonstrated the same missing D3DMetal API and the mapped-buffer mirroring and fence-ordered copyback approach. This project adapts that design for JWE3, with a queue wait to order copyback before the game’s fence. The upstream MIT copyright notice is preserved. [Reference implementation at the revision consulted](https://github.com/fladnaG86/FH2-Port-AppleSilicon/blob/cb0164e640e3362aac4fbdd75a00d437c5c00ddf/src/d3d12/d3d12.c) · [Upstream MIT notice](../LICENSE.fh2)
