@@ -1,8 +1,19 @@
 # Jurassic World Evolution 3 CrossOver Fix
 
-JWE3 1.5.6 needs two fixes on the tested CrossOver Preview setup. MacGameFix's Wine module emulates the execution breakpoint the game expects under Rosetta. The game-local D3D12 shim then handles a heap operation that D3DMetal does not implement. The shim is the same DLL used for the earlier game build. See [Technical details](Docs/Technical.md) for the original graphics crash and shim design.
+JWE3 1.5.6 runs on [CrossOver 26.3](#crossover-263-stable) and [CrossOver Preview 27](#crossover-preview-27) with the fixes below. MacGameFix's Wine module emulates the execution breakpoint the game expects under Rosetta. The game-local D3D12 shim then handles a heap operation that D3DMetal does not implement. See [Technical details](Docs/Technical.md) for the original graphics crash and shim design.
 
 ## Install for JWE3 1.5.6
+
+### CrossOver 26.3 (stable)
+
+1. Use CrossOver **26.3.0.39832**. Quit Steam and any other Windows apps running in CrossOver, then quit CrossOver. Keep a copy of the original `CrossOver.app` so you can restore it later.
+2. Get **Game Porting Toolkit 4.0 beta 3** from [Apple Developer](https://developer.apple.com/games/game-porting-toolkit/). Open the **Evaluation environment for Windows games 4.0 beta 3** disk image and find the `external` and `wine` folders under `redist/lib`.
+3. In Finder, right-click `CrossOver.app` and choose **Show Package Contents**. Open `Contents/SharedSupport/CrossOver/lib64/apple_gptk` and replace both the `external` and `wine` folders there with the two folders from the disk image.
+4. Open [MacGameFix](https://github.com/MathiasKowoll/MacGameFix). Under **Improvements → Copy protection under Rosetta**, enable the switch for **CrossOver 26.3**. Do this after copying the folders so MacGameFix re-signs the updated app when it installs the Wine module. [MacGameFix installation details](https://github.com/MathiasKowoll/MacGameFix/blob/main/engine/README.md#installing-them)
+5. Reopen CrossOver, select the Steam bottle, and set its graphics backend to **D3DMetal**. Open **Wine Configuration** for that bottle, leave **Default Settings** selected under **Applications**, then go to **Libraries**. Add `d3d12`, select it in **Existing overrides**, and set it to **Native, then Builtin**.
+6. Start Steam in that bottle. From JWE3's library entry, select **Manage → Browse local files** and copy [`d3d12.dll`](bin/d3d12.dll) beside `JWE3.exe`. Click **Play** in Steam.
+
+### CrossOver Preview 27
 
 1. Use CrossOver Preview **27.0.0.41073 (20261015)** with an Intel Windows bottle and **D3DMetal 4 beta 3**. Quit Steam and the other Windows apps running in Preview, then quit Preview. Keep a copy of the original CrossOver Preview app if you want to restore its original signature without reinstalling.
 2. Get MacGameFix from its [GitHub repository](https://github.com/MathiasKowoll/MacGameFix) and open the app. Under **Improvements → Copy protection under Rosetta**, enable the switch for **CrossOver Preview 20261015 (27.0.0.41073)**. MacGameFix replaces the matching Intel Wine module and re-signs the CrossOver Preview app. [MacGameFix installation details](https://github.com/MathiasKowoll/MacGameFix/blob/main/engine/README.md#installing-them)
@@ -11,7 +22,7 @@ JWE3 1.5.6 needs two fixes on the tested CrossOver Preview setup. MacGameFix's W
 
 ## Collect logs and report a problem
 
-1. Quit JWE3 and fully exit Steam using **Steam → Exit**. In CrossOver Preview, select the bottle that contains JWE3, select its **Steam** launcher, and click **Run with Options**.
+1. Quit JWE3 and fully exit Steam using **Steam → Exit**. In CrossOver or CrossOver Preview, select the bottle that contains JWE3, select its **Steam** launcher, and click **Run with Options**.
 2. Enable **Create log file** and choose a location for the CrossOver `.cxlog`, such as your Desktop. Enter `+loaddll,+seh` under **Wine logging channels**. Add this line under **Environment variables**:
 
    ```text
@@ -30,14 +41,15 @@ Include these details in the issue.
 - What happened, when it happened (with time zone), and the steps to reproduce it. Include any error message.
 - JWE3 version and Steam build ID, if available.
 - Mac chip, macOS version, exact CrossOver build, and the bottle’s graphics backend and D3DMetal version.
-- MacGameFix version, whether **Copy protection under Rosetta** was enabled, and whether you set a `d3d12` override for `JWE3.exe`.
+- MacGameFix version, whether **Copy protection under Rosetta** was enabled, and whether the `d3d12` override was set for the whole bottle or for `JWE3.exe`.
 
 ## Uninstall
 
-Quit the game and Steam. Remove the shim or restore the DLL you backed up, then remove the per-game override if you added one. Turn off the Rosetta improvement in MacGameFix to restore CrossOver's original Wine module. To restore the original vendor-signed app, use the saved copy or reinstall the matching CodeWeavers build.
+Quit the game and Steam. Remove the shim or restore the DLL you backed up, then remove the `d3d12` override you added in **Wine Configuration**. Turn off the Rosetta improvement in MacGameFix to restore CrossOver's original Wine module. To restore the original app bundle, including the original D3DMetal files on stable, use the saved copy or reinstall the matching CodeWeavers build.
 
 ## Tested setup
 
+- **JWE3 1.5.6 (Steam build `26407273`)** was confirmed running on stable CrossOver `26.3.0.39832` with the MacGameFix Wine module, both GPTK 4.0 beta 3 folders, the game-local shim, and the bottle's `d3d12` override set to **Native, then Builtin**.
 - **JWE3 1.5.6 (Steam build `26407273`)** opened in a direct launch with both fixes on an M4 Pro, macOS 27.2, CrossOver Preview `27.0.0.41073`, and D3DMetal 4 beta 3. The normal Steam **Play** launch after installing the module into Preview is pending verification.
 - **Earlier Steam build `25967550`** launched through Steam with the D3D12 shim alone. The menu, settings, and first campaign level worked. Camera movement, textures, and models were checked in that level.
 
