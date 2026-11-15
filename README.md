@@ -15,7 +15,7 @@ JWE3 1.5.6 runs on [CrossOver 26.3](#crossover-263-stable) and [CrossOver Previe
 
 ### CrossOver Preview 27
 
-1. Use CrossOver Preview **27.0.0.41073 (20261015)** with an Intel Windows bottle and **D3DMetal 4 beta 3**. Quit Steam and the other Windows apps running in Preview, then quit Preview. Keep a copy of the original CrossOver Preview app if you want to restore its original signature without reinstalling.
+1. Use CrossOver Preview with an Intel Windows bottle and **D3DMetal 4 beta 3**. Quit Steam and the other Windows apps running in Preview, then quit Preview. Keep a copy of the original CrossOver Preview app if you want to restore its original signature without reinstalling.
 2. Get MacGameFix from its [GitHub repository](https://github.com/MathiasKowoll/MacGameFix) and open the app. Under **Improvements → Copy protection under Rosetta**, enable the switch for **CrossOver Preview 20261015 (27.0.0.41073)**. MacGameFix replaces the matching Intel Wine module and re-signs the CrossOver Preview app. [MacGameFix installation details](https://github.com/MathiasKowoll/MacGameFix/blob/main/engine/README.md#installing-them)
 3. Reopen CrossOver Preview and start Steam in the Intel bottle. In JWE3's Steam library entry, select **Manage → Browse local files** and copy [`bin/d3d12.dll`](bin/d3d12.dll) beside `JWE3.exe`. Back up any existing game-local `d3d12.dll` before replacing it.
 4. Click **Play** in Steam. If the game loads the system D3D12 DLL first, open the bottle's **Wine Configuration**, add `JWE3.exe` under **Applications**, and set the `d3d12` override under **Libraries** to **Native, then Builtin** for that executable.
